@@ -288,10 +288,131 @@ This introduced the first non-linear execution. Although you might realise, whoe
 <br>At first glance, the pipeline looks unnecessarily complicated. Why not interpret source code directly?
 Because each stage removes one kind of complexity:
 
-<br><br>Lexer removes character-level ambiguity.
+<br>Lexer removes character-level ambiguity.
 <br>Parser removes syntactic ambiguity.
 <br>Compiler removes structural complexity.
 <br>VM executes only simple instructions.
 
-<br><br>Each layer converts a complex problem into a simpler one for the next layer.
+<br>Each layer converts a complex problem into a simpler one for the next layer.
 Without this separation, every part of the system would need to understand everything else.<br><br>
+
+### Phase 6 : Functions, Callstack and Runtime Completion (24/03/2026)
+(Incidentally, I just discovered that backticks make your text look like `this`, and be taken literally. Also, ALT + 26 enters an arrow. Siiiiick. Anyway...)<br>
+If my roommates tell you that I laughed like a psychopath in the middle of the night when my code finally stopped doing black magic, don't believe them. If you do decide to believe them, in my defence, if you knew how many times I wanted to commit an exorcism on my laptop, you would, too.
+<br>But on a more serious note, functions was definitely the most conceptually intricate phase of the VM. But the idea I started with that made things slightly easier was:<br>
+`A function is just a bytecode entry point.`
+<br>`A call is just jumping after saving context.`
+<br>`A return is just restoring that context.`
+<br>(Compiling a function involves the same trick as if/else, by the way: backpatching.)
+<br>An important realization: Arguments are already on the stack. Return values are pushed onto the stack. No copying or magic needed.
+<br><br>The core invariant that everything depended on:
+
+`frameBase = stack.size() - argCount`
+
+Locals are accessed as:
+
+`stack[frameBase + slot]`
+
+If this invariant breaks, the entire call stack collapses.
+
+<br><br>Several additions had to be made to `Compiler`: 
+<br>-mapping functions to their bytecode index
+<br>-`stack scopeStack` and `function resolveLocal` to enforce lexical scoping: inner blocks can see their parent blocks, but not vice versa.
+<br>-`stack nextLocalSlot` to preserve the independence of a function's local variables, and `int functionDepth` to ensure that a return call outside a function is prohibited.
+<br><br>Control flow + functions together was the real boss fight. Because they exposed the nitty-gritty details of the decisions I made on the way. Scoping not bulletproof? Locals start leaking outside their blocks. Tiny issue in CALL/RET semantics? Violent segfault with a diabolical error message.
+<br>When two or more concepts stress test your VM like that, you can be sure that past sins are gonna come knocking.
+
+<br><br>Some bugs that had me ~~(speaking a language unknown to the human race)~~ dealing with them gracefully:
+<br>-CALL using a frameBase that was off by one → "Thanks for playing!" 💀
+<br>-If anything is above frameBase on the stack after function return, it's a return value. Parameter count has nothing to do with it, which I learnt by mulishly blundering through a couple of segfaults.
+<br>-Using `scopeStack.back["name"]` instead of `resolveLocal(name)` → broken lexical scoping.
+
+##### Testing & Instrumentation
+This is where it hit me like a truck: I could literally write codes in this. It's a complete language runtime. So I did. I wrote diabolical test codes:
+```Example
+fun multiply(a, b) {
+    let result = 0;
+    let i = 0;
+    while (i < b) {
+        result = result + a;
+        i = i + 1;
+    }
+    return result;
+}
+
+fun power(base, exp) {
+    let result = 1;
+    let i = 0;
+    while (i < exp) {
+        result = multiply(result, base);
+        i = i + 1;
+    }
+    return result;
+}
+
+fun factorial(n) {
+    if (n == 0) return 1;
+    return multiply(n, factorial(n - 1));
+}
+
+fun fib(n) {
+    if (n == 0) return 0;
+    if (n == 1) return 1;
+    return fib(n - 1) + fib(n - 2);
+}
+
+fun sumTo(n) {
+    let sum = 0;
+    let i = 1;
+    while (i < n) {
+        sum = sum + i;
+        i = i + 1;
+    }
+    return sum;
+}
+
+fun collatz(n) {
+    let steps = 0;
+    while (n != 1) {
+        if (n == multiply(n / 2, 2)) {
+            n = n / 2;
+        } else {
+            n = multiply(n, 3) + 1;
+        }
+        steps = steps + 1;
+    }
+    return steps;
+}
+
+print multiply(17, 13);
+print power(2, 16);
+print factorial(10);
+print fib(20);
+print sumTo(1000);
+print collatz(27);
+```
+<br>Before I show you the output, adding instrumentation was one of the most satisfying parts of this whole project. Because it made the output look like:
+```Output
+221
+65536
+3628800
+6765
+499500
+111
+$>--=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--<$
+6452560 instruction(s) executed in 256193 microseconds.
+Number of garbage collections: 0
+Number of objects collected: 0
+Maximum stack depth: 12
+$>--=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--<$
+```
+<br>That stats output at the bottom understandably gave me an unholy amount of dopamine. When I ran the numbers, I had to take a step back: My VM was running more than **25 Million instructions Per Second**. Which is surprisingly competitive for a naive stack-based interpreter.
+<br>At this point, the VM supports:
+
+<br>- variables and lexical scoping
+<br>- control flow (if / while)
+<br>- functions and recursion
+<br>- stack-based execution
+<br>- bytecode interpretation
+<br><br>This is no longer a toy interpreter.
+<br>This is a complete, minimal programming language runtime.<br>
