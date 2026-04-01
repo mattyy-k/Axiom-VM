@@ -415,4 +415,82 @@ $>--=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--<$
 <br>- stack-based execution
 <br>- bytecode interpretation
 <br><br>This is no longer a toy interpreter.
-<br>This is a complete, minimal programming language runtime.<br>
+<br>This is a complete, minimal programming language runtime.<br><br>
+
+#### Phase 7: Compiler Optimizations, Compiler Errors, Arrays, and Project Completion
+The previous phase felt like a boss fight. This one felt like a victory lap. 😈
+
+
+Compiler errors turned out to be simpler than expected because the parser was already structured defensively:
+```
+if (match(...)) proceed;
+else error;
+```
+All I had to do was replace placeholders with actual error reporting.
+
+I implemented a `hadError` flag to allow the compiler to accumulate multiple errors in a single pass (instead of failing fast), similar to real-world compilers. Since tokens already carried line numbers, error reporting became precise with minimal extra work.
+
+This reinforced a key lesson: good early design decisions compound. Small structural choices in the parser eliminated entire classes of future complexity.
+
+
+A nice side-effect of recursive descent: I got `else if` chains for free.
+
+Since `else` accepts any statement, and `if` itself is a statement, nesting naturally handles chained conditionals without any special-case logic.
+
+This was one of those moments where the parsing strategy directly simplifies language semantics. Recursive descent is seriously cool. 🙏
+
+I had to refactor `parsePrimary()` to support index chaining.
+
+Previously, expressions returned immediately, which prevented constructs like:
+- `arr[1][2][1]`
+- `fn()[3]`
+
+The fix was to delay returning and iteratively wrap the expression in `IndexExpr` nodes while `[` tokens are present.
+
+This small structural change enabled arbitrarily deep indexing with no additional grammar rules.
+
+By the way, arrays can have heterogenous elements in my programming language. So, an array can look like, `[69, "your mom", true, 6.7]`.Take that, statically-typed languages!
+
+
+**Compiler Optimizations**
+
+Constant folding and peephole optimization behaved exactly as they should—but not as I initially expected.
+
+They had negligible impact on compute-heavy benchmarks (loops, recursion), because most values are only known at runtime. However, they reduced bytecode size in programs dominated by constant expressions.
+
+The key realization:
+```
+Compile-time optimizations only help when the program exposes compile-time information.
+```
+
+In my case:
+- arithmetic-heavy loops → no improvement
+- constant-heavy programs → measurable reduction
+
+So while local optimizations are working correctly, meaningful gains require global reasoning about values.
+
+
+**Wow. I'm done.**
+
+This project went from “build a VM” to a full language runtime:
+
+- Lexer, parser, and AST
+- Bytecode compiler
+- Stack-based virtual machine
+- Call stack + function support
+- Mark-and-sweep garbage collector
+- Error reporting with recovery
+- Basic compiler optimizations
+- Arrays with dynamic typing and indexing
+
+More importantly, it forced me to think in terms of:
+- execution models
+- invariants
+- memory safety
+- tradeoffs between compile-time and runtime work
+
+This isn’t just “code that runs”—it’s a system I can reason about, measure, and improve.
+
+I’m calling the VM complete (for now). What a journey. (If you think I'm unrealistically calm about this in this log, don't worry, I screamed like a banshee in real life lol)
+
+Now it's time to build something on top of it.
