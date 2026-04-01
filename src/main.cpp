@@ -11,6 +11,11 @@
 #include <map>
 using namespace std;
 
+#define RESET   "\033[0m"
+#define RED     "\033[31m"
+#define YELLOW  "\033[33m"
+#define BOLD    "\033[1m"
+
 enum class Opcode {
     PUSH,
     POP,
@@ -215,6 +220,10 @@ int maxStackDepth = 0;
 int heapAllocations = 0;
 int gcRuns = 0;
 int objectsCollected = 0;
+int constantFolds = 0;
+int gcTime = 0;
+
+bool hadError = false;
 
 struct Token {
     TokenType type;
@@ -226,11 +235,13 @@ class Compiler;
 struct Expr {
     virtual ~Expr() = default; // to enable polymorphism and consistent treatment of all expressions.
     virtual void compile(Compiler &c){};
+    virtual Expr* fold() { return this; }
 };
 
 struct Stmt {
     virtual ~Stmt() = default;
     virtual void compile(Compiler& c){};
+    virtual void fold(){};
 };
 
 class Compiler {
@@ -254,6 +265,7 @@ class Compiler {
             case TokenType::MINUS: return Opcode::SUB;
             case TokenType::MULTIPLY: return Opcode::MUL;
             case TokenType::DIVIDE: return Opcode::DIV;
+            case TokenType::MOD: return Opcode::MOD;
 
             case TokenType::EQUAL_EQUAL: return Opcode::EQUAL;
             case TokenType::NOTEQUAL: return Opcode::NOTEQUAL;
@@ -278,16 +290,96 @@ class Compiler {
     unordered_map<string, int> functions;
 
     vector<int> compileProgram(vector<Stmt*> stmts){
+        for (auto stmt : stmts) {
+            stmt->fold();
+        } //constant folding
+
         for (auto stmt : stmts){
             stmt->compile(*this);
-        }
+        } //compilation
+
         bytecode.push_back((int)Opcode::HALT);
         for (auto stmt : stmts){
             delete stmt;
-        }
+        } //deleting the AST
+
         return bytecode;
     }
 };
+void compileError(const string& message, int line) {
+    cerr << BOLD << RED << "[Compile Error]" << RESET
+         << " Line " << line << ": " << message << "\n";
+    hadError = true;
+}
+struct Instr { // for peephole optimizer
+    Opcode op;
+    vector<int> args;
+    int size;
+};
+Instr readInstr(const vector<int>& bc, int i) { // instruction reader helper
+    Opcode op = (Opcode)bc[i];
+    Instr ins;
+    ins.op = op;
+
+    switch(op) {
+        case Opcode::PUSH:
+        case Opcode::GET_LOCAL:
+        case Opcode::SET_LOCAL:
+        case Opcode::ALLOC_ARRAY:
+        case Opcode::ALLOC_STRING:
+        case Opcode::JUMP:
+        case Opcode::JUMP_IF_FALSE:
+            ins.args = { bc[i+1] };
+            ins.size = 2;
+            break;
+
+        case Opcode::CALL:
+            ins.args = { bc[i+1], bc[i+2] };
+            ins.size = 3;
+            break;
+
+        default:
+            ins.size = 1;
+    }
+    return ins;
+}
+void emitInstr(vector<int>& out, const Instr& ins) { // helper to emit instructions
+    out.push_back((int)ins.op);
+    for (int x : ins.args) out.push_back(x);
+}
+
+vector<int> optimize(const vector<int> bc) { //actual peephole optimizer
+    vector<int> out;
+
+    for (int i = 0; i < bc.size();) {
+        Instr a = readInstr(bc, i);
+
+        if (i + a.size < bc.size()) {
+            Instr b = readInstr(bc, i + a.size);
+
+            if (a.op == Opcode::PUSH && b.op == Opcode::POP) { // Pattern: [PUSH X, POP] -> overall nothing; skip both
+                i += a.size + b.size; // skip both
+                continue;
+            }
+            if (a.op == Opcode::GET_LOCAL && b.op == Opcode::SET_LOCAL && a.args[0] == b.args[0]) { //Pattern: [GET_LOCAL X, SET_LOCAL X]
+                i += a.size + b.size;
+                continue;
+            }
+            if (a.op == Opcode::PUSH && b.op == Opcode::JUMP_IF_FALSE && a.args[0] == 1) { // Pattern: [PUSH true, JUMP_IF_FALSE X] -> skip both
+                i += a.size + b.size;
+                continue;
+            }
+            if (a.op == Opcode::JUMP && a.args[0] == i + 2) {
+                i += 2;
+                continue;
+            }
+        }
+        emitInstr(out, a);
+        i += a.size;
+    }
+    return out;
+}
+
 struct Value { //tagged union
     ValueType tag;
     union {
@@ -345,6 +437,78 @@ struct BinaryExpr : Expr {
     TokenType op;
     Expr* right;
 
+    Expr* fold() override {
+        left = left->fold();
+        right = right->fold();
+
+        auto l = dynamic_cast<LiteralExpr*>(left);
+        auto r = dynamic_cast<LiteralExpr*>(right);
+
+        if (op == TokenType::PLUS) {
+            if (l && l->value.data.intVal == 0) {
+                delete left;
+                return right;
+            }
+            if (r && r->value.data.intVal == 0) {
+                delete right;
+                return left;
+            }
+        }
+        if (op == TokenType::MULTIPLY) {
+            if (l && l->value.data.intVal == 1) {
+                delete left;
+                return right;
+            }
+            if (r && r->value.data.intVal == 1) {
+                delete right;
+                return left;
+            }
+        }
+        if (op == TokenType::MULTIPLY) {
+            if ((l && l->value.data.intVal == 0) ||
+                (r && r->value.data.intVal == 0)) {
+                delete left;
+                delete right;
+                return new LiteralExpr(Value::Int(0));
+            }
+        }
+
+        if (l && r) {
+            constantFolds++;
+            int lv = (l->value.tag == ValueType::BOOL) ? l->value.data.boolVal : l->value.data.intVal;
+            int rv = (r->value.tag == ValueType::BOOL) ? r->value.data.boolVal : r->value.data.intVal;
+            delete left;
+            delete right;
+
+            int result;
+
+            switch(op) {
+                case TokenType::PLUS: result = lv + rv; break;
+                case TokenType::MINUS: result = lv - rv; break;
+                case TokenType::MULTIPLY: result = lv * rv; break;
+                case TokenType::DIVIDE:
+                    if (rv == 0) return this; // don't fold unsafe
+                    result = lv / rv;
+                    break;
+                case TokenType::MOD:
+                    if (rv == 0) return this;
+                    result = lv % rv;
+                    break;
+                case TokenType::EQUAL_EQUAL: return new LiteralExpr(Value::Bool(lv == rv));
+                case TokenType::NOTEQUAL: return new LiteralExpr(Value::Bool(lv != rv));
+                case TokenType::LESS_THAN: return new LiteralExpr(Value::Bool(lv < rv));
+                case TokenType::LESSEQUAL: return new LiteralExpr(Value::Bool(lv <= rv));
+                case TokenType::GRTR_THAN: return new LiteralExpr(Value::Bool(lv > rv));
+                case TokenType::GRTREQL: return new LiteralExpr(Value::Bool(lv >= rv));
+
+                default:
+                    return this;
+            }
+        return new LiteralExpr(Value::Int(result));
+        }
+        return this;
+    }
+
     void compile(Compiler& c) {
         left->compile(c);
         right->compile(c);
@@ -357,9 +521,31 @@ struct BinaryExpr : Expr {
         delete right;
     }
 };
+
 struct UnaryExpr : Expr {
     TokenType op;
     Expr* exp;
+
+    Expr* fold() override {
+        exp = exp->fold();
+
+        auto l = dynamic_cast<LiteralExpr*>(exp);
+        if (!l) return this;
+
+        if (op == TokenType::MINUS) {
+            int v = (l->value.tag == ValueType::BOOL) ? l->value.data.boolVal : l->value.data.intVal;
+            delete exp;
+            constantFolds++;
+            return new LiteralExpr(Value::Int(-v));
+        }
+        if (op == TokenType::NOT) {
+            bool v = l->value.data.boolVal;
+            delete exp;
+            constantFolds++;
+            return new LiteralExpr(Value::Bool(!v));
+        }
+        return this;
+    }
 
     void compile(Compiler &c){
         exp->compile(c);
@@ -386,12 +572,13 @@ struct GroupingExpr : Expr {
 };
 struct IdentifierExpr : Expr {
     string name;
+    int line;
 
-    IdentifierExpr(string n) : name(n) {}
+    IdentifierExpr(string n, int l) : name(n), line(l) {}
     void compile(Compiler& c){
         //auto it = c.scopeStack.back().find(name); we have to look through all scopes, not just the top one
         int slot = c.resolveLocal(name);
-        if (slot == -1) { cerr << "Undefined variable.\n"; return; }
+        if (slot == -1) { compileError("Undefined variable '" + name + "'", line); return; }
         
         c.bytecode.push_back((int)Opcode::GET_LOCAL);
         c.bytecode.push_back(slot);
@@ -412,12 +599,74 @@ struct StringLiteralExpr : Expr {
         c.bytecode.push_back(index);
     }
 };
+struct ArrayLiteralExpr : Expr {
+    vector<Expr*> elements;
+    ArrayLiteralExpr(vector<Expr*> e) : elements(e) {}
+    ~ArrayLiteralExpr() {
+        for (auto e : elements) delete e;
+    }
+
+    Expr* fold() override {
+        for (int i = 0; i < (int)elements.size(); i++)
+            elements[i] = elements[i]->fold();
+        return this;
+    }
+
+    void compile(Compiler& c) {
+        c.bytecode.push_back((int)Opcode::ALLOC_ARRAY);
+        c.bytecode.push_back(elements.size());
+        for (int i = 0; i < (int)elements.size(); i++) {
+            c.bytecode.push_back((int)Opcode::PUSH);
+            c.bytecode.push_back(i);
+            elements[i]->compile(c);
+            c.bytecode.push_back((int)Opcode::SET_INDEX);
+        }
+    }
+};
+struct IndexExpr : Expr {
+    Expr* array;
+    Expr* index;
+    IndexExpr(Expr* a, Expr* i) : array(a), index(i) {}
+    ~IndexExpr() { delete array; delete index; }
+    Expr* fold() override {
+        array = array->fold();
+        index = index->fold();
+        return this;
+    }
+    void compile(Compiler& c) {
+        array->compile(c);
+        index->compile(c);
+        c.bytecode.push_back((int)Opcode::GET_INDEX);
+    }
+};
+struct IndexAssignStmt : Stmt {
+    Expr* array;
+    Expr* index;
+    Expr* value;
+    IndexAssignStmt(Expr* a, Expr* i, Expr* v) : array(a), index(i), value(v) {}
+    ~IndexAssignStmt() { delete array; delete index; delete value; }
+    void fold() {
+        array = array->fold();
+        index = index->fold();
+        value = value->fold();
+    }
+    void compile(Compiler& c) {
+        array->compile(c);
+        index->compile(c);
+        value->compile(c);
+        c.bytecode.push_back((int)Opcode::SET_INDEX);
+        c.bytecode.push_back((int)Opcode::POP);
+    }
+};
 
 struct ExprStmt : Stmt { // compile an expression
     Expr* expr;
     ExprStmt(Expr* e) : expr(e) {}
     ~ExprStmt() {
         delete expr;
+    }
+    void fold() {
+        expr = expr->fold();
     }
     void compile(Compiler& c){
         expr->compile(c);
@@ -427,17 +676,20 @@ struct ExprStmt : Stmt { // compile an expression
 struct VarDeclStmt : Stmt { // introduce a name and store a local value on the callstack
     string name;
     Expr* initializerExpr;
-    VarDeclStmt(string n, Expr* e) : name(n), initializerExpr(e) {}
+    int line;
+    VarDeclStmt(string n, Expr* e, int l) : name(n), initializerExpr(e), line(l) {}
     ~VarDeclStmt() {
         delete initializerExpr;
+    }
+
+    void fold() {
+        initializerExpr = initializerExpr->fold();
     }
 
     void compile(Compiler& c){
         initializerExpr->compile(c); // push compiled value onto the stack
         c.scopeStack.back()[name] = c.nextLocalSlot.back(); 
-        // IMPORTANT: 
-        // (i) CONVERT NEXTLOCALSLOT TO A VECTOR<INT> -> c.nextLocalSlot becomes c.nextLocalSlot.back().
-        // (ii) CONVERT VarSlots -> scopeStack.back().
+
         c.bytecode.push_back((int)Opcode::SET_LOCAL); // push setlocal back into bytecode
         c.bytecode.push_back(c.nextLocalSlot.back());
         c.nextLocalSlot.back()++;
@@ -446,11 +698,17 @@ struct VarDeclStmt : Stmt { // introduce a name and store a local value on the c
 };
 struct AssignmentStmt : Stmt { // modify an existing variable (variable must exist on the top of the callstack)
     string name;
+    int line;
     Expr* valueExpr;
-    AssignmentStmt(string n, Expr* e) : name(n), valueExpr(e) {}
+    AssignmentStmt(string n, Expr* e, int l) : name(n), valueExpr(e), line(l) {}
     ~AssignmentStmt() {
         delete valueExpr;
     }
+
+    void fold() {
+        valueExpr = valueExpr->fold();
+    }
+
     void compile(Compiler& c){
         valueExpr->compile(c); //compile value
         c.bytecode.push_back((int)Opcode::SET_LOCAL); // emit set local
@@ -491,6 +749,10 @@ struct PrintStmt : Stmt {
         delete expr;
     }
 
+    void fold() {
+        expr = expr->fold();
+    }
+
     void compile(Compiler& c) {
         expr->compile(c);
         c.bytecode.push_back((int)Opcode::PRINT);
@@ -502,6 +764,12 @@ struct BlockStmt : Stmt {
     ~BlockStmt() {
         for (auto i : stmts) {
             delete i;
+        }
+    }
+
+    void fold() {
+        for (auto stmt : stmts) {
+            stmt->fold();
         }
     }
 
@@ -543,6 +811,12 @@ struct IfStmt : Stmt {
         if (elseBlock) delete elseBlock;
     }
 
+    void fold() {
+        cond = cond->fold();
+        ifBlock->fold();
+        if (elseBlock) elseBlock->fold();
+    }
+
     int emitJump(Opcode jumptype, Compiler& c){
         c.bytecode.push_back((int)jumptype);
         return c.bytecode.size();
@@ -571,6 +845,11 @@ struct WhileStmt : Stmt {
     Expr* cond;
     Stmt* block;
     WhileStmt(Expr* e, Stmt* b) : cond(e), block(b) {}
+
+    void fold() {
+        cond = cond->fold();
+        block->fold();
+    }
 
     int emitJump(Opcode jumptype, Compiler& c){
         c.bytecode.push_back((int)jumptype);
@@ -601,6 +880,11 @@ struct FunctionStmt : Stmt { // for function declaration
     ~FunctionStmt() { 
         delete block; 
     }
+
+    void fold() {
+        block->fold();
+    }
+
     int emitJump(Opcode jumptype, Compiler& c){
         c.bytecode.push_back((int)jumptype);
         return c.bytecode.size();
@@ -640,6 +924,10 @@ struct ReturnStmt : Stmt { // for function return value
     ~ReturnStmt() {
         delete value;
     }
+
+    void fold() {
+        value = value->fold();
+    }
     void compile(Compiler& c) {
         if (c.functionDepth == 0) {
             cerr << "Error: Return statement outside of function.\n";
@@ -653,7 +941,8 @@ struct ReturnStmt : Stmt { // for function return value
 struct CallExpr : Expr { // for function call
     string callee;
     vector<Expr*> arguments;
-    CallExpr(string c, vector<Expr*> a) : callee(c), arguments(a) {}
+    int line;
+    CallExpr(string c, vector<Expr*> a, int l) : callee(c), arguments(a), line(l) {}
     ~CallExpr() {
         for (auto i : arguments) {
             delete i;
@@ -972,24 +1261,24 @@ class Parser {
     Parser(vector<Token> t) : tokens(t), index(0) {}
 
     // helper functions:
-    Token peek (){
+    Token peek (){ // look at the current token
         if (index < tokens.size()) return tokens[index];
         Token temp;
         temp.type = TokenType::ENDOF;
         return temp;
     }
-    void advance(){
+    void advance(){ //move to the next token
         index++;
     }
-    bool match(TokenType t){
+    bool match(TokenType t){ //match and increment to the next token
         if (index < tokens.size() && tokens[index].type == t) { index++; return true; }
         return false;
     }
-    bool check(TokenType t){
+    bool check(TokenType t){ // boolean check current token without increment
         if (index < tokens.size() && tokens[index].type == t) return true;
         return false;
     }
-    Token nextCheck(){
+    Token nextCheck(){ // check the next token
         if (index + 1 < tokens.size()) return tokens[index + 1];
         Token temp;
         temp.type = TokenType::ENDOF;
@@ -1003,17 +1292,35 @@ class Parser {
         return stmts;
     }
     Stmt* parseStatement(){
+        if (peek().type == TokenType::IDENTIFIER && nextCheck().type == TokenType::LEFT_BRACKET) {
+            string name = peek().lexeme;
+            int line = peek().line;
+            advance(); // consume identifier
+            advance(); // consume '['
+
+            Expr* idx = parseExpression();
+            if (!match(TokenType::RIGHT_BRACKET)) compileError("Expected ']'", line);
+            if (!match(TokenType::EQUAL)) compileError("Expected '='", line);
+            Expr* val = parseExpression();
+
+            if (check(TokenType::SEMICOLON)) advance();
+            else compileError("Expected ';'", line);
+            return new IndexAssignStmt(new IdentifierExpr(name, line), idx, val);
+        }
         if (match(TokenType::PRINT)) {
             Expr* value = parseExpression();
             if (check(TokenType::SEMICOLON)) advance();
+            else compileError("Expected ';'", peek().line);
             return new PrintStmt(value);
+            perror("");
         }
         if (peek().type == TokenType::IDENTIFIER) {
             if (nextCheck().type == TokenType::EQUAL){
                 string temp = peek().lexeme;
+                int line = peek().line;
                 advance();
                 advance();
-                Stmt* stmt = new AssignmentStmt(temp, parseExpression());
+                Stmt* stmt = new AssignmentStmt(temp, parseExpression(), line);
                 if (peek().type == TokenType::SEMICOLON) advance();
                 return stmt;
             }
@@ -1026,10 +1333,15 @@ class Parser {
         else if (match(TokenType::LET)){
             if (peek().type == TokenType::IDENTIFIER){
                 string temp = peek().lexeme;
+                int line = peek().line;
                 advance();
+
                 if (peek().type == TokenType::EQUAL) advance();
-                Stmt* stmt = new VarDeclStmt(temp, parseExpression());
+                else compileError("Expected '='", line);
+
+                Stmt* stmt = new VarDeclStmt(temp, parseExpression(), line);
                 if (peek().type == TokenType::SEMICOLON) advance();
+                else compileError("Expected ';'", line);
                 return stmt;
             }
         }
@@ -1037,7 +1349,7 @@ class Parser {
             if (match(TokenType::LEFT_PAREN)){
                 Expr* cond = parseExpression();
                 if (!match(TokenType::RIGHT_PAREN)) {
-                    perror("Expected ')'");
+                    compileError("Expected ')'", peek().line);
                 }
                 
                 Stmt* block = parseStatement();
@@ -1048,22 +1360,23 @@ class Parser {
                 Stmt* ifstmt = new IfStmt(cond, block, elseBlock);
                 return ifstmt;
             }
-            //else compiler error
+            else compileError("Expected '('", peek().line);
         }
         else if (match(TokenType::FUN)){
             if (check(TokenType::IDENTIFIER)){
                 string name = peek().lexeme;
+                int line = peek().line;
                 advance();
+
                 if (!match(TokenType::LEFT_PAREN)) {
-                    perror("Expected '(' near function declaration");
-                    //compiler error
+                    compileError("Expected '('", line);
                 }
                 vector<string> params;
 
                 if (!check(TokenType::RIGHT_PAREN)) {
                     do {
                         if (!check(TokenType::IDENTIFIER)) {
-                            perror("Expected parameter name");
+                            compileError("Expected parameter name", peek().line);
                             //compiler error
                         }
                         params.push_back(peek().lexeme);
@@ -1071,8 +1384,7 @@ class Parser {
                     } while (match(TokenType::COMMA));
                 }
                 if (!match(TokenType::RIGHT_PAREN)){
-                    perror("Expected ')' near function declaration");
-                    //compiler error
+                    compileError("Expected ')' near function declaration", line);
                 }
                 Stmt* block = parseStatement();
                 //cout << "Function compiled successfully.\n";
@@ -1083,7 +1395,7 @@ class Parser {
         else if (match(TokenType::RETURN)){
             Expr* val = parseExpression();
             if (!match(TokenType::SEMICOLON)){
-                cerr << "Expected semicolon\n";
+                compileError("Expected ';'", peek().line);
             }
             return new ReturnStmt(val);
         }
@@ -1091,14 +1403,14 @@ class Parser {
             if (match(TokenType::LEFT_PAREN)){
                 Expr* cond = parseExpression();
                 if (!match(TokenType::RIGHT_PAREN)) {
-                    cerr << "Expected ')'\n";
+                    compileError("Expected ';'", peek().line);
                 }
                 
                 Stmt* block = parseStatement();
                 Stmt* whstmt = new WhileStmt(cond, block);
                 return whstmt;
             }
-            // else compiler error
+            else compileError("Expected '('", peek().line);
         }
         else if (match(TokenType::LEFT_BRACE)){
             vector<Stmt*> stmts;
@@ -1108,13 +1420,14 @@ class Parser {
             advance(); //consume right brace
             return new BlockStmt(stmts);
         }
-        else //if (peek().type == TokenType::INTEGER) - WRONG, because statements can start with '-', '!', '(', etc, not just integers.
-        {
+        else{
             Stmt* stmt = new ExprStmt(parseExpression());
             if (peek().type == TokenType::SEMICOLON) advance();
+            else compileError("Expected ';'", peek().line);
+            
             return stmt;
         }
-        cerr << "Error: Unexpected token at statement\n";
+        compileError("Error: Unexpected token at statement", peek().line);
         advance();
         Stmt* error = new ErrorStmt(peek().line);
         return error;
@@ -1197,62 +1510,83 @@ class Parser {
         }
         else return parsePrimary();
     }
-    Expr* parsePrimary(){
-        if (match(TokenType::TRUE)) return new LiteralExpr(Value::Bool(true));
-        if (match(TokenType::FALSE)) return new LiteralExpr(Value::Bool(false));
-        if (peek().type == TokenType::INTEGER){
+    Expr* parsePrimary() {
+        Expr* expr = nullptr;
+
+        if (match(TokenType::TRUE)) {
+            expr = new LiteralExpr(Value::Bool(true));
+        }
+        else if (match(TokenType::FALSE)) {
+            expr = new LiteralExpr(Value::Bool(false));
+        }
+        else if (peek().type == TokenType::INTEGER) {
             int val = stoi(peek().lexeme);
             advance();
             Value value;
             value.tag = ValueType::INT;
             value.data.intVal = val;
-
-            Expr* expr = new LiteralExpr(value);
-            return expr; // this is a leaf node
+            expr = new LiteralExpr(value);
         }
         else if (peek().type == TokenType::STRING) {
             string str = peek().lexeme;
             advance();
-            return new StringLiteralExpr(str);
+            expr = new StringLiteralExpr(str);
         }
-        else if (peek().type == TokenType::IDENTIFIER){
-            if (nextCheck().type == TokenType::LEFT_PAREN){
+        else if (peek().type == TokenType::LEFT_BRACKET) {
+            advance();
+            vector<Expr*> elements;
+            if (!check(TokenType::RIGHT_BRACKET)) {
+                do {
+                    elements.push_back(parseExpression());
+                } while (match(TokenType::COMMA));
+            }
+            if (!match(TokenType::RIGHT_BRACKET))
+                compileError("Expected ']' after array elements", peek().line);
+            expr = new ArrayLiteralExpr(elements);
+        }
+        else if (peek().type == TokenType::IDENTIFIER) {
+            if (nextCheck().type == TokenType::LEFT_PAREN) {
                 string callee = peek().lexeme;
+                int line = peek().line;
                 vector<Expr*> arguments;
-                advance(); // consume the function name (callee)
-                advance(); // consume the left parenthesis
+                advance();
+                advance();
                 if (!check(TokenType::RIGHT_PAREN)) {
                     do {
                         arguments.push_back(parseExpression());
                     } while (match(TokenType::COMMA));
                 }
-                if(!match(TokenType::RIGHT_PAREN)){
-                    cerr << "Expected ')' near function call\n";
-                }
-
-                return new CallExpr(callee, arguments);
+                if (!match(TokenType::RIGHT_PAREN))
+                    compileError("Expected ')' near function call", peek().line);
+                expr = new CallExpr(callee, arguments, line);
             }
             else {
                 Token temp = peek();
                 advance();
-                Expr* expr = new IdentifierExpr(temp.lexeme);
-                return expr; //another leaf node
+                expr = new IdentifierExpr(temp.lexeme, temp.line);
             }
         }
-        else if (peek().type == TokenType::LEFT_PAREN){
+        else if (peek().type == TokenType::LEFT_PAREN) {
             advance();
-            Expr* expr = parseExpression();
-            if (peek().type == TokenType::RIGHT_PAREN) { 
-                advance();
-                GroupingExpr* exp = new GroupingExpr(expr);
-                return exp;
-            }
+            Expr* inner = parseExpression();
+            if (peek().type == TokenType::RIGHT_PAREN) advance();
+            expr = new GroupingExpr(inner);
         }
-        int line = tokens[index].line;
-        Expr* error = new ErrorExpr(line);
-        cerr << "Expected Expression on Line " << line;
-        advance();
-        return error;
+        else {
+            int line = peek().line;
+            compileError("Expected expression on line", line);
+            advance();
+            return new ErrorExpr(line);
+        }
+        // index chaining — runs for any expression
+        while (check(TokenType::LEFT_BRACKET)) {
+            advance();
+            Expr* idx = parseExpression();
+            if (!match(TokenType::RIGHT_BRACKET))
+                compileError("Expected ']'", peek().line);
+            expr = new IndexExpr(expr, idx);
+        }
+        return expr;
     }
 };
 
@@ -1356,30 +1690,59 @@ void collectGarbage(VM &vm){
     }
     allocatedSinceLastGC = 0;
 }
-map<Opcode, int> opcodeCount;
+int opcodeCount[(int)Opcode::HALT + 1] = {0};
 
-int main (){
+int main(int argc, char* argv[]) {
     VM vm;
-    ifstream file("program.vm");
+    string filename = "program.vm"; // default
+    bool showBytecode = false;
+    bool showStats = false;
+    bool showOpcodeCount = false;
+    bool showCompileTime = false;
+
+    for (int i = 1; i < argc; i++) {
+        string arg = argv[i];
+        if (arg == "--bytecode" || arg == "-b") showBytecode = true;
+        else if (arg == "--stats" || arg == "-s") showStats = true;
+        else if (arg == "--opcodes" || arg == "-o") showOpcodeCount = true;
+        else if (arg == "--compile" || arg == "-c") showCompileTime = true;
+        else if (arg == "--all" || arg == "-a") {
+            showBytecode = true;
+            showStats = true;
+            showOpcodeCount = true;
+        }
+        else filename = arg; // anything that isn't a flag is the filename
+    }
+    ifstream file(filename);
+    if (!file.is_open()) {
+        cerr << "Error: could not open file '" << filename << "'\n";
+        return 1;
+    }
     string src(
         (istreambuf_iterator<char>(file)),
         istreambuf_iterator<char>()
     ); // take the entire program as input string.
     Lexer lexer(src);
+    Compiler c;
+
+    auto startCompile = std::chrono::high_resolution_clock::now();
     vector<Token> tokens = lexer.scanTokens();
     Parser parser(tokens);
     vector<Stmt*> stmts = parser.parseProgram();
-    Compiler c;
     
-    auto startCompile = std::chrono::high_resolution_clock::now();
-    vm.bc = c.compileProgram(stmts);
+    auto raw = c.compileProgram(stmts);
+    vm.bc = optimize(raw);
+
     auto endCompile = std::chrono::high_resolution_clock::now();
     auto durationCompile = std::chrono::duration_cast<std::chrono::microseconds>(endCompile - startCompile);
-    cout << "##########\nCompile time: " << durationCompile.count() << " microseconds. \n##########\n\n";
 
     vm.constants = c.stringConstants; // transfer constant pool
 
-    disassemble(c.bytecode); // print bytecode for debugging purposes.
+    if (showBytecode) disassemble(vm.bc); // print bytecode for debugging purposes.
+    if (hadError) {
+        cerr << BOLD << RED << "Compilation failed. Aborting.\n" << RESET;
+        return 1;
+    }
 
     bool running = true;
     auto start = std::chrono::high_resolution_clock::now();
@@ -1395,7 +1758,7 @@ int main (){
 
                 //cout << "Pushed " << value.data.intVal << endl; // all such prints are for debugging purposes
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::POP:{
@@ -1404,7 +1767,7 @@ int main (){
 
                 //cout << "Popped" << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::ADD:{
@@ -1422,7 +1785,7 @@ int main (){
 
                 //cout << "Added " << op1.data.intVal << " and " << op2.data.intVal << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::SUB:{
@@ -1441,7 +1804,7 @@ int main (){
 
                 //cout << "Subtracted " << op1.data.intVal << " and " << op2.data.intVal << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::MUL:{
@@ -1460,7 +1823,7 @@ int main (){
 
                 //cout << "Multiplied " << op1.data.intVal << " and " << op2.data.intVal << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::DIV:{
@@ -1480,7 +1843,7 @@ int main (){
 
                 //cout << "Divided " << op1.data.intVal << " and " << op2.data.intVal << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::MOD:{
@@ -1500,12 +1863,12 @@ int main (){
 
                 //cout << "Mod " << op1.data.intVal << " and " << op2.data.intVal << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::HALT:{
                 running = false;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 break;
             }
             case Opcode::CALL:{
@@ -1521,7 +1884,7 @@ int main (){
                 vm.ip = vm.bc[vm.ip + 2];
 
                 //cout << "Called @ " << vm.ip << "\n";
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::ALLOC_STRING:{
@@ -1529,35 +1892,61 @@ int main (){
                 int index = vm.bc[++vm.ip];
 
                 string str = vm.constants[index]; //bytecode references strings in a constant pool, since it cannot pass strings on its own.
-                int handle = (!freedheap.empty() ? freedheap.front() :  vm.heap.size());
+                int handle;
 
-                if (!freedheap.empty()) freedheap.pop();
-                vm.heap.push_back(HeapObject::String(str));
+                if (!freedheap.empty()) {
+                    handle = freedheap.front();
+                    freedheap.pop();
+                    vm.heap[handle] = HeapObject::String(str); // reuse the slot
+                } else {
+                    handle = vm.heap.size();
+                    vm.heap.push_back(HeapObject::String(str)); // grow the heap
+                }
                 allocatedSinceLastGC++;
 
                 if (allocatedSinceLastGC > 50) {
+                    auto startGC = std::chrono::high_resolution_clock::now();
                     collectGarbage(vm);
+                    auto endGC = std::chrono::high_resolution_clock::now();
+                    auto durationGC = std::chrono::duration_cast<std::chrono::microseconds>(endGC - startGC);
+                    gcTime += durationGC.count();
                     gcRuns++;
                 }
                 vm.opst.push_back(Value::Object(handle));
                 maxStackDepth = max(maxStackDepth, (int)vm.opst.size());
 
                 //cout << "Allocated string" << str << endl;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
+                vm.ip++;
                 continue;
             }
             case Opcode::ALLOC_ARRAY:{
                 int n = vm.bc[++vm.ip];
-                int handle = (!freedheap.empty() ? freedheap.front() :  vm.heap.size());
-                if (!freedheap.empty()) freedheap.pop();
-                vm.heap.push_back(HeapObject::Array(n));
+                int handle;
+                if (!freedheap.empty()) {
+                    handle = freedheap.front();
+                    freedheap.pop();
+                    vm.heap[handle] = HeapObject::Array(n);
+                } else {
+                    handle = vm.heap.size();
+                    vm.heap.push_back(HeapObject::Array(n));
+                }
+                
                 allocatedSinceLastGC++;
-                if (allocatedSinceLastGC > 50) collectGarbage(vm);
+                if (allocatedSinceLastGC > 50) {
+                    auto startGC = std::chrono::high_resolution_clock::now();
+                    collectGarbage(vm);
+                    auto endGC = std::chrono::high_resolution_clock::now();
+                    auto durationGC = std::chrono::duration_cast<std::chrono::microseconds>(endGC - startGC);
+                    gcTime += durationGC.count();
+                    gcRuns++;
+                }
                 vm.opst.push_back(Value::Object(handle));
                 maxStackDepth = max(maxStackDepth, (int)vm.opst.size());
 
                 //cout << "Allocated array\n";
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
+                vm.ip++;
                 continue;
             }
             case Opcode::GET_INDEX:{
@@ -1577,7 +1966,7 @@ int main (){
 
                 //cout << "Got heap value at index " << n.data.intVal << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::SET_INDEX:{
@@ -1592,13 +1981,13 @@ int main (){
                 assert(ref.tag == ValueType::OBJECT);
                 assert(index.data.intVal < vm.heap[ref.data.objectHandle].arr.size() && index.data.intVal >= 0 
                 && vm.heap[ref.data.objectHandle].type == HeapType::ARRAY);
-                vm.opst.pop_back();
+                //vm.opst.pop_back();
 
                 vm.heap[ref.data.objectHandle].arr[index.data.intVal] = value;
 
                 //cout << "Set heap value at index " << index.data.intVal << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::GRTRTHAN:{
@@ -1613,7 +2002,7 @@ int main (){
 
                 //cout << "Compared > and pushed boolean " << ret << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::GRTREQUAL:{
@@ -1628,7 +2017,7 @@ int main (){
 
                 //cout << "compared >= and pushed boolean " << ret << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::EQUAL:{
@@ -1644,7 +2033,7 @@ int main (){
 
                 //cout << "Compared == and pushed boolean " << ret << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::LESSTHAN:{
@@ -1659,7 +2048,7 @@ int main (){
 
                 //cout << "Compared < and pushed boolean " << ret << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::LESSEQUAL:{
@@ -1674,7 +2063,7 @@ int main (){
 
                 //cout << "Compared <= and pushed boolean " << ret << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::NOTEQUAL:{
@@ -1689,7 +2078,7 @@ int main (){
 
                 //cout << "Compared != and pushed boolean " <<  ret << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::GET_LOCAL: {
@@ -1704,7 +2093,7 @@ int main (){
 
                 //cout << "Pushed local @ " << n << "\n";
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::SET_LOCAL:{
@@ -1715,7 +2104,7 @@ int main (){
                     continue;
                 }
                 Value val = vm.opst.back();
-                //vm.opst.pop_back(); this line is incorrect and was a pretty frustrating bug; we already emit POP after SET_LOCAL, so the VM ends up popping twice -> stack underflow
+                //vm.opst.pop_back(); incorrect because we already emit POP after SET_LOCAL, so the VM ends up popping twice -> stack underflow
                 callFrame &frame = vm.callst.back();
                 
                 if (n >= frame.locals.size()) frame.locals.resize(n + 1);
@@ -1723,7 +2112,7 @@ int main (){
 
                 //cout << "Set local\n";
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::NEG:{
@@ -1732,9 +2121,8 @@ int main (){
                 vm.opst.pop_back();
                 vm.opst.push_back(Value::Int(-v));
 
-                cout << "Negated and pushed integer" << -v << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::NOT:{
@@ -1743,9 +2131,8 @@ int main (){
                 vm.opst.pop_back();
                 vm.opst.push_back(Value::Bool(!v));
 
-                cout << "Boolean negated and pushed boolean " << !v << endl;
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::RET:{
@@ -1767,7 +2154,7 @@ int main (){
                 vm.ip = retIP;
 
                 //cout << "Returned to: " << retIP << "\n";
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::PRINT: {
@@ -1795,7 +2182,7 @@ int main (){
                 }
 
                 vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::JUMP_IF_FALSE: {
@@ -1807,18 +2194,19 @@ int main (){
                 int n = vm.bc[++vm.ip];
                 if (!val.data.boolVal) vm.ip = n;
                 else vm.ip++;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             case Opcode::JUMP: {
                 int n = vm.bc[++vm.ip];
                 vm.ip = n;
-                opcodeCount[oc]++;
+                opcodeCount[(int)oc]++;
                 continue;
             }
             default:{
                 perror("Wrong opcode");
                 running = false;
+                instructionsExecuted--;
                 break;
             }
         }
@@ -1826,21 +2214,24 @@ int main (){
     auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
-    cout << "\n$>--=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--<$\n" << instructionsExecuted << 
-    " instruction(s) executed in " << duration.count() << " microseconds.\n";
-    cout << "Number of garbage collections: " << gcRuns << "\n";
-    cout << "Number of objects collected: " << objectsCollected << "\n";
-    cout << "Maximum stack depth: " << maxStackDepth << "\n$>--=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--<$" << "\n\n";
+    if (showCompileTime) cout << "\n---------------------------------\n| Compile time: " << durationCompile.count() << " microseconds |\n---------------------------------\n\n";
 
-    string option;
-    cout << "Would you like to print Opcode count? [y/n] ";
-    cin >> option;
-    if (option == "y") {
+    if (showStats) {
+        cout << "\n$>--=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--<$\n" << instructionsExecuted << 
+        " instruction(s) executed in " << duration.count() << " microseconds.\n";
+        cout << "Number of garbage collections: " << gcRuns << "\n";
+        cout << "Number of objects collected: " << objectsCollected << "\n";
+        cout << "Total GC Time: " << gcTime << " microseconds\n";
+        cout << "Maximum stack depth: " << maxStackDepth << "\n";
+        cout << "Constant folds: " << constantFolds << "\n";
+        cout << "$>--=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--<$" << "\n\n";
+    }
+
+    if (showOpcodeCount) {
         cout << "##############\n";
-        for (auto& [op, count] : opcodeCount) {
-            cout << opcodeName(op) << ": " << count << "\n";
+        for (int i = 0; i < 29; i++) {
+            cout << opcodeName((Opcode)i) << ": " << opcodeCount[i] << "\n";
         }
         cout << "##############\n";
     }
-    else cout << "Thank you!\n";
 }
