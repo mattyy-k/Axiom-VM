@@ -1,118 +1,320 @@
-# Virtual Machine
+# Axiom VM
 
-Welcome to my VM project!
+Axiom VM is a bytecode-compiled scripting language runtime built from scratch in C++.
 
-This repository is currently in its early stages. I’ll be pushing updates regularly as I build out a fully custom virtual machine from scratch.
+Source code is compiled via a hand-written lexer and recursive descent parser into a flat bytecode instruction set, which is executed by a stack-based virtual machine with real call frames, lexical scoping, and a mark-and-sweep garbage collector.
 
-This README will evolve into full documentation for the VM as it becomes more complete.
+This is not a tree-walking interpreter. Source goes in, bytecode comes out, and a VM executes it.
 
-## Virtual Machine Architecture (Design Phase)
-### Overview
+---
 
-This document describes the architectural design and implementation plan for a stack-based virtual machine.
-The project is currently in the design phase; implementation will begin after validating architectural decisions.
+## Performance
 
-## Design Goals
+Benchmarked on a mixed workload combining recursion, iteration, and function calls (fibonacci, power, factorial, collatz):
+```
+221
+65536
+3628800
+6765
+499500
+111
 
-Build a clear, minimal, and extensible virtual machine
+$>--=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--<$
+6452560 instruction(s) executed in 256193 microseconds.
+Number of garbage collections: 0
+Number of objects collected: 0
+Maximum stack depth: 12
+$>--=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--<$
+```
 
-Prioritize correctness and clarity over premature optimization
+**~25 million VM instructions per second** on this workload.
 
-Design abstractions that allow future extensions (GC, closures, JIT)
+---
 
-## VM Architecture
+## Features
 
-### Execution Model
+### Language
 
-Stack-based virtual machine
+- Integers, booleans, strings, arrays (heterogeneous)
+- Arithmetic, comparison, and logical operators
+- Variables with lexical block scoping
+- Functions with parameters and return values
+- Recursive functions
+- `if / else if / else`
+- `while` loops
+- Array literals, indexing, and element assignment
 
-Instruction Pointer (IP)
+---
 
-Operand stack
+### Compiler
 
-Heap for dynamically allocated objects
+- Hand-written lexer
+- Recursive descent parser
+- Single-pass compilation with backpatching for control flow
+- Bytecode compiler emitting flat integer instruction stream
 
-Central dispatch loop using opcode-based instruction decoding
+**Optimizations**
+- Constant folding (e.g. `60 * 60 * 24 * 365 → PUSH`)
+- Algebraic simplification (`x * 1`, `x + 0`, `x * 0`)
+- Peephole optimizer:
+  - removes redundant `PUSH/POP`
+  - eliminates no-op local assignments
+  - strips dead instructions after `RET`
 
-Instruction Dispatch
+**Error Handling**
+- Line-accurate compiler errors
+- Multiple error accumulation via `hadError` flag
+- Execution aborted on compile failure
 
-Bytecode instruction stream
+---
 
-First byte represents opcode
+### Runtime
 
-Dispatch implemented via a switch-based loop
+- Register-less stack-based virtual machine
+- Switch-based dispatch loop
+- Call frames with fixed local slots (similar to CPython/Lua execution models)
+- Lexical scoping with inner-to-outer resolution
+- Heap with free-list reuse
+- Stack holds values; heap stores objects (strings, arrays)
 
-## Value Model
+---
 
-Dynamically typed
+### Garbage Collector
 
-Single Value type using tagged-union semantics
+Axiom uses a mark-and-sweep garbage collector with a free-list allocator.
 
-Supports primitive values and references to heap-allocated objects
+**Trigger**  
+Runs when allocations since last collection exceed a threshold.
 
-## Memory Model
+**Mark phase**
+- Traverses all roots:
+  - operand stack
+  - locals in every active call frame
+- Recursively marks reachable heap objects
 
-Primitive values stored directly on the VM stack
+**Sweep phase**
+- Frees unmarked objects
+- Recycles memory via free list
 
-Heap-allocated objects referenced via pointers in Value
+**Demonstrated under allocation-heavy workload:**
+```
+109452 instruction(s) executed in 7684 microseconds.
+Number of garbage collections: 35
+Number of objects collected: 1782
+Maximum stack depth: 6
+```
 
-No garbage collection in initial phase (planned to be implemented later)
+Correctly handles deep recursion and live references across frames.
 
-## Planned Phases
+---
 
-### Phase 1 — Core VM
+### Instrumentation
 
-Bytecode format
+CLI flags expose internal execution:
 
-Instruction dispatch
+- Bytecode disassembler
+- Execution stats:
+  - instruction count
+  - elapsed time
+  - GC runs
+  - objects collected
+  - max stack depth
+  - constant folds
+- Opcode frequency table
 
-Arithmetic and control flow
+---
 
-### Phase 2 — Memory & Call Stack
+## Usage
+```
+axiom program.vm # run
+axiom program.vm -s # run + stats
+axiom program.vm -b # run + disassemble bytecode
+axiom program.vm -c # run + compile time
+axiom program.vm -o # opcode frequency
+axiom program.vm -a # all instrumentation
+```
 
-Heap allocator
+---
 
-Stack frames and function calls
+## Example Program
 
-### Phase 3 — Garbage Collection
+```vm
+fun factorial(n) {
+    if (n == 0) return 1;
+    return n * factorial(n - 1);
+}
 
-Mark-and-sweep collector
+fun fib(n) {
+    if (n == 0) return 0;
+    if (n == 1) return 1;
+    return fib(n - 1) + fib(n - 2);
+}
 
-Root tracking
+fun sumArray(arr, len) {
+    let i = 0;
+    let sum = 0;
+    while (i < len) {
+        sum = sum + arr[i];
+        i = i + 1;
+    }
+    return sum;
+}
 
-### Phase 4 — Parser & Compiler
+let nums = [1,2,3,4,5,6,7,8,9,10];
 
-Tokenizer
+print factorial(10);
+print fib(20);
+print sumArray(nums, 10);
+```
 
-AST
+### Example Bytecode
+```bytecode
+0: JUMP -> 27
+2: GET_LOCAL slot=0
+4: PUSH 0
+6: EQ
+7: JUMP_IF_FALSE -> 12
+9: PUSH 1
+11: RET
+12: GET_LOCAL slot=0
+14: GET_LOCAL slot=0
+16: PUSH 1
+18: SUB
+19: CALL argc=1 target=2
+22: MUL
+23: RET
+24: PUSH 0
+26: RET
+27: JUMP -> 70
+29: GET_LOCAL slot=0
+31: PUSH 0
+33: EQ
+34: JUMP_IF_FALSE -> 39
+36: PUSH 0
+38: RET
+39: GET_LOCAL slot=0
+41: PUSH 1
+43: EQ
+44: JUMP_IF_FALSE -> 49
+46: PUSH 1
+48: RET
+49: GET_LOCAL slot=0
+51: PUSH 1
+53: SUB
+54: CALL argc=1 target=29
+57: GET_LOCAL slot=0
+59: PUSH 2
+61: SUB
+62: CALL argc=1 target=29
+65: ADD
+66: RET
+67: PUSH 0
+69: RET
+70: JUMP -> 116
+72: PUSH 0
+74: SET_LOCAL slot=2
+76: POP
+77: PUSH 0
+79: SET_LOCAL slot=3
+81: POP
+82: GET_LOCAL slot=2
+84: GET_LOCAL slot=1
+86: LT
+87: JUMP_IF_FALSE -> 110
+89: GET_LOCAL slot=3
+91: GET_LOCAL slot=0
+93: GET_LOCAL slot=2
+95: GET_INDEX
+96: ADD
+97: SET_LOCAL slot=3
+99: POP
+100: GET_LOCAL slot=2
+102: PUSH 1
+104: ADD
+105: SET_LOCAL slot=2
+107: POP
+108: JUMP -> 82
+110: GET_LOCAL slot=3
+112: RET
+113: PUSH 0
+115: RET
+116: ALLOC_ARRAY size=10
+118: PUSH 0
+120: PUSH 1
+122: SET_INDEX
+123: PUSH 1
+125: PUSH 2
+127: SET_INDEX
+128: PUSH 2
+130: PUSH 3
+132: SET_INDEX
+133: PUSH 3
+135: PUSH 4
+137: SET_INDEX
+138: PUSH 4
+140: PUSH 5
+142: SET_INDEX
+143: PUSH 5
+145: PUSH 6
+147: SET_INDEX
+148: PUSH 6
+150: PUSH 7
+152: SET_INDEX
+153: PUSH 7
+155: PUSH 8
+157: SET_INDEX
+158: PUSH 8
+160: PUSH 9
+162: SET_INDEX
+163: PUSH 9
+165: PUSH 10
+167: SET_INDEX
+168: SET_LOCAL slot=0
+170: POP
+171: PUSH 10
+173: CALL argc=1 target=2
+176: PRINT
+177: PUSH 20
+179: CALL argc=1 target=29
+182: PRINT
+183: GET_LOCAL slot=0
+185: PUSH 10
+187: CALL argc=2 target=72
+190: PRINT
+191: HALT
+```
 
-Bytecode compiler
+## Architecture
+```
+Source Code
+    │
+    ▼
+Lexer                    (hand-written, single pass)
+    │
+    ▼
+Recursive Descent Parser (AST generation)
+    │
+    ▼
+Constant Folding Pass    (AST-level optimization)
+    │
+    ▼
+Bytecode Compiler        (flat instruction stream + backpatching)
+    │
+    ▼
+Peephole Optimizer       (post-pass simplification)
+    │
+    ▼
+Stack-based VM           (execution, call frames, heap, GC)
+```
+## Future Work
+- Tail call optimization
+- Closures and first-class functions
+Optional type system
+JIT compilation for hot paths
 
-### Phase 5 — Advanced Features
 
-Optimizations / JIT OR
+## Author
 
-Debugger & REPL OR
+Built by **Maitreya Kulkarni** — NITK IT (2nd year)
 
-Closures and TCO
-
-### Non-Goals (Initial Phases)
-
-Garbage collection
-
-Closures
-
-JIT compilation
-
-Native FFI
-
-Multithreading
-
-### Status
-
-Phase 0 (Architecture & Design): Complete
-
-Phase 1 (Implementation): Upcoming
-
-If you’re interested in the day-to-day progress — design decisions, debugging disasters, breakthroughs, and lessons learned — check out the **progression.md** file.  
-I’ll be treating it like a build log / dev diary for this project.
+Also: [Forge Shell](https://github.com/mattyy-k/Forge-Shell) — a POSIX-compliant shell in C++ used as the development and benchmarking environment for Axiom VM.
